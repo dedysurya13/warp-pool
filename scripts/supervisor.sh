@@ -9,7 +9,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/common.sh"
 
 declare -A PID=()
-LAST_REGISTER=0
+# Shared clock: all slots consult the same timestamp, so the rate-limit guard
+# actually serialises registrations instead of letting each slot sleep alone.
+LAST_REGISTER_FILE="$STATE_DIR/.last-register"
+
+get_last_register() {
+    [ -f "$LAST_REGISTER_FILE" ] && cat "$LAST_REGISTER_FILE" 2>/dev/null || echo 0
+}
+
+mark_register() {
+    date +%s > "$LAST_REGISTER_FILE"
+}
+
 STATUS_FILE="$STATE_DIR/status.json"
 
 cleanup() {
@@ -36,16 +47,17 @@ start_slot() {
     fi
 
     # Respect a delay between WARP registrations to avoid Cloudflare rate limits.
-    local now elapsed
+    local now elapsed last
+    last="$(get_last_register)"
     now="$(date +%s)"
-    elapsed=$(( now - LAST_REGISTER ))
-    if [ "$LAST_REGISTER" -ne 0 ] && [ "$elapsed" -lt "$REGISTER_DELAY" ]; then
+    elapsed=$(( now - last ))
+    if [ "$last" -ne 0 ] && [ "$elapsed" -lt "$REGISTER_DELAY" ]; then
         local wait_for=$(( REGISTER_DELAY - elapsed ))
         log "slot $idx: waiting ${wait_for}s before registering (rate limit guard)"
         sleep "$wait_for"
     fi
 
-    LAST_REGISTER="$(date +%s)"
+    mark_register
     "$SCRIPT_DIR/register-slot.sh" "$idx" >>"$dir/slot.log" 2>&1 &
     PID[$idx]=$!
 }
