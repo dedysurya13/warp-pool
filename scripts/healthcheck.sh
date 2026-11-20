@@ -28,9 +28,9 @@ fi
 printf '%-6s %-7s %-17s %-10s %s\n' SLOT PORT IP STATUS COOLDOWN
 for (( i=0; i<POOL_SIZE; i++ )); do
     port="$(slot_port "$i")"
-    ip="$(slot_meta "$i" ip)"
-    st="$(slot_meta "$i" status)"
-    cd_until="$(slot_meta "$i" cooldown_until)"
+    ip="$(st_get "$i" ip)"
+    st="$(st_get "$i" status)"
+    cd_until="$(st_get "$i" cooldown_until)"
     cd_human="-"
     if [ "$cd_until" != "none" ] && [ "$cd_until" -gt "$(date +%s)" ] 2>/dev/null; then
         cd_human="$(date -d "@$cd_until" '+%H:%M:%S')"

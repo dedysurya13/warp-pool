@@ -23,6 +23,24 @@ mark_register() {
 
 STATUS_FILE="$STATE_DIR/status.json"
 
+# --- state helpers (write slot status files; healthcheck reads them) ---
+
+st_get() {
+    local idx="$1" key="$2" file
+    file="$POOL_DIR/slot-$idx/state.json"
+    [ -f "$file" ] || { echo "none"; return; }
+    jq -r --arg k "$key" '.[$k] // "none"' "$file" 2>/dev/null || echo "none"
+}
+
+st_set() {
+    local idx="$1" key="$2" val="$3" file tmp
+    file="$POOL_DIR/slot-$idx/state.json"
+    mkdir -p "$POOL_DIR/slot-$idx"
+    [ -f "$file" ] || echo '{}' > "$file"
+    tmp="$(mktemp)"
+    jq --arg k "$key" --arg v "$val" '.[$k] = $v' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
 cleanup() {
     log "supervisor: shutting down"
     for idx in "${!PID[@]}"; do
@@ -38,11 +56,11 @@ start_slot() {
     local dir; dir="$(slot_dir "$idx")"
 
     # Fresh registration only when there is no usable config yet.
-    if [ -f "$dir/wireproxy.conf" ] && [ "$(slot_meta "$idx" status)" != "dead" ]; then
+    if [ -f "$dir/wireproxy.conf" ] && [ "$(st_get "$idx" status)" != "dead" ]; then
         log "slot $idx: reusing existing wireproxy config"
         HOME="$dir" wireproxy -c "$dir/wireproxy.conf" >>"$dir/wireproxy.log" 2>&1 &
         PID[$idx]=$!
-        slot_set "$idx" status "starting"
+        st_set "$idx" status "starting"
         return 0
     fi
 
@@ -68,7 +86,7 @@ restart_slot() {
         kill "${PID[$idx]}" 2>/dev/null || true
         wait "${PID[$idx]}" 2>/dev/null || true
     fi
-    slot_set "$idx" status "dead"
+    st_set "$idx" status "dead"
     start_slot "$idx"
 }
 
@@ -99,7 +117,7 @@ write_status() {
 log "supervisor: starting pool of $POOL_SIZE on ports $BASE_PORT..$(( BASE_PORT + POOL_SIZE - 1 ))"
 
 for (( i=0; i<POOL_SIZE; i++ )); do
-    slot_set "$i" slot "$i"
+    st_set "$i" slot "$i"
     start_slot "$i"
     # stagger startup so registrations do not collide
     sleep 2
@@ -126,7 +144,7 @@ while true; do
         ip="$(proxy_alive "$port")"
         if [ -z "$ip" ]; then
             log "slot $i: health check failed on :$port"
-            slot_set "$i" status "dead"
+            st_set "$i" status "dead"
             restart_slot "$i"
             continue
         fi
@@ -135,37 +153,37 @@ while true; do
         dup=0
         for (( j=0; j<POOL_SIZE; j++ )); do
             [ "$j" -eq "$i" ] && continue
-            [ "$(slot_meta "$j" ip)" = "$ip" ] && dup=1 && break
+            [ "$(st_get "$j" ip)" = "$ip" ] && dup=1 && break
         done
 
         if [ "$dup" -eq 1 ]; then
             log "slot $i: duplicate exit IP $ip, re-registering"
-            slot_set "$i" status "duplicate"
+            st_set "$i" status "duplicate"
             rm -f "$dir/wireproxy.conf"
             restart_slot "$i"
             continue
         fi
 
-        slot_set "$i" ip "$ip"
+        st_set "$i" ip "$ip"
 
         target_ok "$port"
         case $? in
-            0) slot_set "$i" status "healthy" ;;
+            0) st_set "$i" status "healthy" ;;
             2)
                 until_ts=$(( $(date +%s) + COOLDOWN_SECONDS ))
                 log "slot $i: rate limited, cooling down until $(date -d "@$until_ts" '+%H:%M:%S')"
-                slot_set "$i" status "cooldown"
-                slot_set "$i" cooldown_until "$until_ts"
+                st_set "$i" status "cooldown"
+                st_set "$i" cooldown_until "$until_ts"
                 ;;
             3)
                 log "slot $i: exit IP $ip blocked by target, replacing"
-                slot_set "$i" status "blocked"
+                st_set "$i" status "blocked"
                 rm -f "$dir/wireproxy.conf"
                 restart_slot "$i"
                 ;;
             *)
                 log "slot $i: target check inconclusive for $ip"
-                slot_set "$i" status "unknown"
+                st_set "$i" status "unknown"
                 ;;
         esac
     done
@@ -173,7 +191,7 @@ while true; do
     # pool health summary
     healthy=0
     for (( i=0; i<POOL_SIZE; i++ )); do
-        [ "$(slot_meta "$i" status)" = "healthy" ] && healthy=$(( healthy + 1 ))
+        [ "$(st_get "$i" status)" = "healthy" ] && healthy=$(( healthy + 1 ))
     done
 
     write_status

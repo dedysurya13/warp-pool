@@ -78,11 +78,11 @@ done
 
 chmod 600 "$CONF"
 
-slot_set "$IDX" port "$PORT"
-slot_set "$IDX" status "starting"
-slot_set "$IDX" created "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-slot_set "$IDX" ip "none"
-slot_set "$IDX" restarts "0"
+STATE="$DIR/state.json"
+[ -f "$STATE" ] || echo '{}' > "$STATE"
+jq --arg port "$PORT" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+   '.slot = "'"$IDX"'" | .port = $port | .status = "starting" | .created = $ts | .ip = "none"' \
+   "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 
 log "slot $IDX: wireproxy config written, starting on :$PORT"
 exec wireproxy -c "$CONF"
