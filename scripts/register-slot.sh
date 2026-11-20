@@ -17,10 +17,12 @@ mkdir -p "$DIR"
 
 log "slot $IDX: registering WARP device (port $PORT)"
 
-# wgcf needs a writable HOME for its config dir
+# wgcf writes ./wgcf-account.toml into the CURRENT DIRECTORY (not $HOME),
+# so we must cd into the slot dir or every slot fights over /app.
+cd "$DIR" || { err "slot $IDX: cannot enter $DIR"; exit 1; }
 export HOME="$DIR"
 
-rm -f "$PROFILE" "$DIR/wgcf-profile.conf"
+rm -f "$DIR/wgcf-account.toml" "$DIR/wgcf-profile.conf"
 
 if ! wgcf register --accept-tos >"$DIR/register.log" 2>&1; then
     err "slot $IDX: wgcf register failed"
@@ -35,7 +37,13 @@ if ! wgcf generate >"$DIR/generate.log" 2>&1; then
 fi
 
 PROFILE_SRC="$DIR/wgcf-profile.conf"
-[ -f "$PROFILE_SRC" ] || { err "slot $IDX: profile not generated"; exit 1; }
+[ -f "$PROFILE_SRC" ] || {
+    err "slot $IDX: profile not generated"
+    echo "--- register.log ---" >&2; tail -8 "$DIR/register.log" >&2 2>/dev/null || true
+    echo "--- generate.log ---" >&2; tail -8 "$DIR/generate.log" >&2 2>/dev/null || true
+    echo "--- dir listing ---" >&2; ls -la "$DIR" >&2 2>/dev/null || true
+    exit 1
+}
 
 # Translate the WireGuard profile into a wireproxy config with a SOCKS5 listener.
 PRIV_KEY="$(awk -F' = ' '/^PrivateKey/{print $2}' "$PROFILE_SRC")"
