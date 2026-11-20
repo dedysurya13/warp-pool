@@ -23,24 +23,6 @@ mark_register() {
 
 STATUS_FILE="$STATE_DIR/status.json"
 
-# --- state helpers (write slot status files; healthcheck reads them) ---
-
-st_get() {
-    local idx="$1" key="$2" file
-    file="$POOL_DIR/slot-$idx/state.json"
-    [ -f "$file" ] || { echo "none"; return; }
-    jq -r --arg k "$key" '.[$k] // "none"' "$file" 2>/dev/null || echo "none"
-}
-
-st_set() {
-    local idx="$1" key="$2" val="$3" file tmp
-    file="$POOL_DIR/slot-$idx/state.json"
-    mkdir -p "$POOL_DIR/slot-$idx"
-    [ -f "$file" ] || echo '{}' > "$file"
-    tmp="$(mktemp)"
-    jq --arg k "$key" --arg v "$val" '.[$k] = $v' "$file" > "$tmp" && mv "$tmp" "$file"
-}
-
 cleanup() {
     log "supervisor: shutting down"
     for idx in "${!PID[@]}"; do

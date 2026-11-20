@@ -34,6 +34,24 @@ slot_dir() {
     echo "$POOL_DIR/slot-$1"
 }
 
+# Read a field from a slot's state.json ("none" if missing).
+st_get() {
+    local idx="$1" key="$2" file
+    file="$(slot_dir "$idx")/state.json"
+    [ -f "$file" ] || { echo "none"; return; }
+    jq -r --arg k "$key" '.[$k] // "none"' "$file" 2>/dev/null || echo "none"
+}
+
+# Write a field into a slot's state.json.
+st_set() {
+    local idx="$1" key="$2" val="$3" file tmp
+    file="$(slot_dir "$idx")/state.json"
+    mkdir -p "$(slot_dir "$idx")"
+    [ -f "$file" ] || echo '{}' > "$file"
+    tmp="$(mktemp)"
+    jq --arg k "$key" --arg v "$val" '.[$k] = $v' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
 # Returns 0 if the proxy on this port answers through WARP.
 proxy_alive() {
     local port="$1" ip
