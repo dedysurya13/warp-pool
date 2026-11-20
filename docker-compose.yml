@@ -1,0 +1,38 @@
+services:
+  warp-pool:
+    build: .
+    image: warp-pool:latest
+    container_name: warp-pool
+    restart: unless-stopped
+    # Proxy hanya diakses dari dalam host / docker network.
+    # JANGAN expose ke 0.0.0.0 — pakai SSH tunnel dari PC lo.
+    ports:
+      - "127.0.0.1:25344:25344"
+      - "127.0.0.1:25345:25345"
+      - "127.0.0.1:25346:25346"
+    volumes:
+      - warp-pool-data:/data
+    environment:
+      POOL_SIZE: "3"
+      BASE_PORT: "25344"
+      CHECK_INTERVAL: "300"
+      COOLDOWN_SECONDS: "1800"
+      REGISTER_DELAY: "60"
+      TARGET_URL: "https://opencode.ai"
+      # opsional: notif Telegram kalau pool di bawah minimum
+      TELEGRAM_BOT_TOKEN: ""
+      TELEGRAM_CHAT_ID: ""
+    healthcheck:
+      test: ["CMD", "/app/scripts/healthcheck.sh", "--quick"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  warp-pool-data:
