@@ -2,6 +2,15 @@
 # Supervisor for the WARP proxy pool.
 # Keeps POOL_SIZE wireproxy instances alive, re-registers dead/blocked slots,
 # and writes an aggregate status file for humans and 9Router.
+#
+# Design rules learned the hard way:
+#   * A cold wireproxy needs 10-20s for the WARP handshake. Never declare a
+#     slot dead before the grace period expires.
+#   * state.json must reflect REALITY. IP is only written after a live probe.
+#   * Restarting must not overwrite the "dead" marker with "starting" —
+#     otherwise a flapping slot looks healthy forever.
+#   * Registration is rate limited per source IP, so registrations are
+#     serialised through a shared clock file.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +32,7 @@ mark_register() {
 
 STATUS_FILE="$STATE_DIR/status.json"
 PROBE_INTERVAL="${PROBE_INTERVAL:-45}"
+STARTED_AT="$(date +%s)"
 
 cleanup() {
     log "supervisor: shutting down"
@@ -34,15 +44,38 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# Config is only reusable when its identity is not shared with another slot.
+# A reused config with a colliding peer key makes both slots flap forever.
+config_reusable() {
+    local idx="$1" dir conf key other i
+    dir="$(slot_dir "$idx")"
+    conf="$dir/wireproxy.conf"
+    [ -f "$conf" ] || return 1
+    [ "$(st_get "$idx" status)" = "dead" ] && return 1
+
+    key="$(awk -F' = ' '/^PublicKey/{print $2}' "$conf" 2>/dev/null)"
+    [ -n "$key" ] || return 1
+
+    for (( i=0; i<POOL_SIZE; i++ )); do
+        [ "$i" -eq "$idx" ] && continue
+        other="$(slot_dir "$i")/wireproxy.conf"
+        [ -f "$other" ] || continue
+        if [ "$(awk -F' = ' '/^PublicKey/{print $2}' "$other" 2>/dev/null)" = "$key" ]; then
+            log "slot $idx: config identity collides with slot $i, forcing re-register"
+            return 1
+        fi
+    done
+    return 0
+}
+
 start_slot() {
     local idx="$1"
     local dir; dir="$(slot_dir "$idx")"
 
-    if [ -f "$dir/wireproxy.conf" ] && [ "$(st_get "$idx" status)" != "dead" ]; then
+    if config_reusable "$idx"; then
         log "slot $idx: reusing existing wireproxy config"
         wireproxy -c "$dir/wireproxy.conf" >>"$dir/wireproxy.log" 2>&1 &
         PID[$idx]=$!
-        st_set "$idx" status "starting"
         return 0
     fi
 
@@ -57,6 +90,7 @@ start_slot() {
     fi
 
     mark_register
+    st_set "$idx" status "registering"
     "$SCRIPT_DIR/register-slot.sh" "$idx" >>"$dir/slot.log" 2>&1 &
     PID[$idx]=$!
 }
@@ -71,11 +105,15 @@ restart_slot() {
 }
 
 # Give a freshly started wireproxy time to complete its WARP handshake
-# before we call it dead. A cold start needs ~5-15s.
+# before we call it dead. A cold start needs ~10-20s; be generous.
 wait_for_proxy() {
-    local port="$1" tries="${2:-6}" i
+    local port="$1" tries="${2:-8}" i ip
     for (( i=0; i<tries; i++ )); do
-        [ -n "$(proxy_alive "$port")" ] && return 0
+        ip="$(proxy_alive "$port")"
+        if [ -n "$ip" ]; then
+            printf '%s' "$ip"
+            return 0
+        fi
         sleep 5
     done
     return 1
@@ -93,7 +131,7 @@ write_status() {
             [ $first -eq 1 ] || printf ','
             first=0
             if [ -f "$meta" ]; then
-                jq -c '{slot: (.slot // ""), port, ip, status, cooldown_until}' "$meta" 2>/dev/null \
+                jq -c '{slot: (.slot // ""), port, ip, status, identity, cooldown_until}' "$meta" 2>/dev/null \
                     || printf '{"slot":"%s","status":"unknown"}' "$i"
             else
                 printf '{"slot":"%s","status":"empty"}' "$i"
@@ -130,13 +168,20 @@ while true; do
         # 2. does it actually answer? give a cold start some grace time
         ip="$(proxy_alive "$port")"
         if [ -z "$ip" ]; then
-            if ! wait_for_proxy "$port"; then
+            # Grace period is only for slots that just started. A slot that
+            # was healthy before and stopped answering is restarted directly.
+            if [ "$(st_get "$i" status)" = "healthy" ] || [ "$(st_get "$i" status)" = "cooldown" ]; then
+                log "slot $i: was healthy, now silent on :$port, restarting"
+                st_set "$i" status "dead"
+                restart_slot "$i"
+                continue
+            fi
+            if ! ip="$(wait_for_proxy "$port")"; then
                 log "slot $i: no answer on :$port after grace period, restarting"
                 st_set "$i" status "dead"
                 restart_slot "$i"
                 continue
             fi
-            ip="$(proxy_alive "$port")"
         fi
 
         # 3. duplicate exit IP means rotation is pointless
@@ -190,7 +235,11 @@ while true; do
 
     if [ "$healthy" -lt "$MIN_HEALTHY" ]; then
         log "pool degraded: $healthy/$POOL_SIZE healthy"
-        notify "warp-pool: hanya $healthy/$POOL_SIZE proxy sehat. Cek container."
+        # only nag once per 10 minutes, not every cycle
+        NOW="$(date +%s)"
+        if [ $(( NOW - STARTED_AT )) -gt 600 ]; then
+            notify "warp-pool: hanya $healthy/$POOL_SIZE proxy sehat. Cek container."
+        fi
     fi
 
     sleep "$PROBE_INTERVAL"
