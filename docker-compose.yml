@@ -9,19 +9,16 @@ services:
     ports:
       # SOCKS5 langsung (klien yang mendukung socks5://)
       - "127.0.0.1:25344:25344"
-      # HTTP lewat privoxy sidecar (9Router dll butuh http://)
-      - "127.0.0.1:8118:8118"
     volumes:
       - warp-data:/data
     environment:
       SOCKS_PORT: "25344"
       HEALTH_URL: "https://api.ipify.org"
       TARGET_URL: "https://opencode.ai"
-      CHECK_INTERVAL: "60"
+      CHECK_INTERVAL: "30"
       COOLDOWN_SECONDS: "1800"
       REGISTER_RETRY_DELAY: "30"
       MAX_REGISTER_ATTEMPTS: "5"
-      # opsional: notif Telegram kalau tunnel gagal terus
       TELEGRAM_BOT_TOKEN: ""
       TELEGRAM_CHAT_ID: ""
     healthcheck:
@@ -46,8 +43,11 @@ services:
       LISTEN_PORT: "8118"
       SOCKS_HOST: "warp"
       SOCKS_PORT: "25344"
+      UPSTREAM_TIMEOUT: "120"
     depends_on:
       - warp
+    ports:
+      - "127.0.0.1:8118:8118"
     logging:
       driver: json-file
       options:
