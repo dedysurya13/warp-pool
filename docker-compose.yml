@@ -4,12 +4,16 @@ services:
     image: warp-pool:latest
     container_name: warp-pool
     restart: unless-stopped
-    # Proxy hanya diakses dari dalam host / docker network.
-    # JANGAN expose ke 0.0.0.0 — pakai SSH tunnel dari PC lo.
+    # SOCKS5 (25344-25346) untuk klien yang mendukung SOCKS,
+    # HTTP (8118-8120) untuk klien yang hanya menerima http:// (9Router dll).
+    # Semua bind ke 127.0.0.1 — akses dari luar lewat SSH tunnel.
     ports:
       - "127.0.0.1:25344:25344"
       - "127.0.0.1:25345:25345"
       - "127.0.0.1:25346:25346"
+      - "127.0.0.1:8118:8118"
+      - "127.0.0.1:8119:8119"
+      - "127.0.0.1:8120:8120"
     volumes:
       - warp-pool-data:/data
     environment:
@@ -19,7 +23,7 @@ services:
       COOLDOWN_SECONDS: "1800"
       REGISTER_DELAY: "60"
       TARGET_URL: "https://opencode.ai"
-      # opsional: notif Telegram kalau pool di bawah minimum
+      # opsional: notif Telegram kalau pool turun di bawah MIN_HEALTHY
       TELEGRAM_BOT_TOKEN: ""
       TELEGRAM_CHAT_ID: ""
     healthcheck:
@@ -33,6 +37,61 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # --- HTTP front-ends -------------------------------------------------
+  # Satu privoxy per slot. network_mode: service:warp-pool supaya bisa
+  # menjangkau 127.0.0.1:2534x milik container warp-pool.
+
+  warp-http-0:
+    image: vimagick/privoxy:latest
+    container_name: warp-http-0
+    restart: unless-stopped
+    network_mode: "service:warp-pool"
+    depends_on:
+      - warp-pool
+    command:
+      - sh
+      - -c
+      - printf 'listen-address 0.0.0.0:8118\nforward-socks5t / 127.0.0.1:25344 .\n' > /etc/privoxy/config && exec privoxy --no-daemon /etc/privoxy/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  warp-http-1:
+    image: vimagick/privoxy:latest
+    container_name: warp-http-1
+    restart: unless-stopped
+    network_mode: "service:warp-pool"
+    depends_on:
+      - warp-pool
+    command:
+      - sh
+      - -c
+      - printf 'listen-address 0.0.0.0:8119\nforward-socks5t / 127.0.0.1:25345 .\n' > /etc/privoxy/config && exec privoxy --no-daemon /etc/privoxy/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  warp-http-2:
+    image: vimagick/privoxy:latest
+    container_name: warp-http-2
+    restart: unless-stopped
+    network_mode: "service:warp-pool"
+    depends_on:
+      - warp-pool
+    command:
+      - sh
+      - -c
+      - printf 'listen-address 0.0.0.0:8120\nforward-socks5t / 127.0.0.1:25346 .\n' > /etc/privoxy/config && exec privoxy --no-daemon /etc/privoxy/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
 volumes:
   warp-pool-data:
