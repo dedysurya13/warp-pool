@@ -1,39 +1,51 @@
 #!/usr/bin/env bash
-# Health/status helper.
-#   healthcheck.sh            -> human readable table
-#   healthcheck.sh --quick    -> exit 0 if at least one proxy answers (docker healthcheck)
-#   healthcheck.sh --json     -> machine readable
+# Health/status helper untuk agent WARP tunggal.
+#   healthcheck.sh            -> tabel status
+#   healthcheck.sh --quick    -> exit 0 kalau tunnel menjawab (docker healthcheck)
+#   healthcheck.sh --json     -> isi state.json mentah
 
 set -uo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=common.sh
-. "$SCRIPT_DIR/common.sh"
+
+STATE_DIR="${STATE_DIR:-/data}"
+STATE_FILE="$STATE_DIR/state.json"
+SOCKS_PORT="${SOCKS_PORT:-25344}"
+HEALTH_URL="${HEALTH_URL:-https://api.ipify.org}"
+
+proxy_ip() {
+    curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+        "$HEALTH_URL" 2>/dev/null
+}
 
 MODE="${1:-table}"
 
 if [ "$MODE" = "--quick" ]; then
-    for (( i=0; i<POOL_SIZE; i++ )); do
-        if [ -n "$(proxy_alive "$(slot_port "$i")")" ]; then
-            exit 0
-        fi
-    done
+    [ -n "$(proxy_ip)" ] && exit 0
     exit 1
 fi
 
 if [ "$MODE" = "--json" ]; then
-    cat "$STATE_DIR/status.json" 2>/dev/null || echo '{"slots":[]}'
+    cat "$STATE_FILE" 2>/dev/null || echo '{}'
     exit 0
 fi
 
-printf '%-6s %-7s %-17s %-10s %s\n' SLOT PORT IP STATUS COOLDOWN
-for (( i=0; i<POOL_SIZE; i++ )); do
-    port="$(slot_port "$i")"
-    ip="$(st_get "$i" ip)"
-    st="$(st_get "$i" status)"
-    cd_until="$(st_get "$i" cooldown_until)"
-    cd_human="-"
-    if [ "$cd_until" != "none" ] && [ "$cd_until" -gt "$(date +%s)" ] 2>/dev/null; then
-        cd_human="$(date -d "@$cd_until" '+%H:%M:%S')"
-    fi
-    printf '%-6s %-7s %-17s %-10s %s\n' "$i" "$port" "$ip" "$st" "$cd_human"
-done
+st_get() {
+    [ -f "$STATE_FILE" ] || { echo "none"; return; }
+    jq -r --arg k "$1" '.[$k] // "none"' "$STATE_FILE" 2>/dev/null || echo "none"
+}
+
+LIVE="$(proxy_ip)"
+CD="$(st_get cooldown_until)"
+CD_HUMAN="-"
+if [ "$CD" != "none" ] && [ "$CD" -gt "$(date +%s)" ] 2>/dev/null; then
+    CD_HUMAN="$(date -d "@$CD" '+%H:%M:%S')"
+fi
+
+echo "status        : $(st_get status)"
+echo "identity      : $(st_get identity)"
+echo "ip (state)    : $(st_get ip)"
+echo "ip (live)     : ${LIVE:-MATI}"
+echo "leak          : $(st_get leak)"
+echo "cooldown      : $CD_HUMAN"
+echo "registered    : $(st_get registered)"
+echo "last ok       : $(st_get last_ok)"
+echo "last rotate   : $(st_get last_rotate_reason)"

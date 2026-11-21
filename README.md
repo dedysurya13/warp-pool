@@ -1,154 +1,132 @@
-# warp-pool
+# warp-pool — satu proxy WARP yang menyembuhkan diri sendiri
 
-Proxy pool otomatis berbasis Cloudflare WARP. Menjaga N proxy tetap hidup, mendeteksi IP mati/duplikat/kena limit, lalu mendaftarkan device WARP baru sendiri.
+Satu identitas WARP, satu tunnel, satu IP. Kalau tunnel tidak bisa dipakai,
+agent langsung membuang profilnya, register ulang, dan menyalakan tunnel baru.
 
-Tersedia dalam **dua protokol**:
+Tidak ada pool, tidak ada slot, tidak ada rebutan identitas.
 
-| Protokol | Port | Untuk klien |
-|---|---|---|
-| SOCKS5 | `25344`–`25346` | klien yang mendukung `socks5://` |
-| HTTP | `8118`–`8120` | klien yang hanya menerima `http://` (9Router, dsb) |
+## Kenapa bukan pool
 
-Port HTTP dilayani `privoxy` yang meneruskan ke SOCKS5 WARP di slot yang sama.
+Versi sebelumnya menjalankan 3 slot paralel. Masalahnya: Cloudflare hanya
+mengizinkan satu peer aktif per device. Ketika tiga slot memakai identitas
+yang sama (karena `wgcf` membaca cache global saat registrasi kena rate
+limit), mereka saling kick di setiap handshake — hasilnya restart-loop
+tanpa henti dan hanya satu slot yang kebetulan hidup.
 
-## Cara kerja
+Satu tunnel yang selalu diverifikasi jauh lebih andal daripada tiga tunnel
+yang saling membunuh.
 
-```
-wgcf      -> daftarkan device WARP, hasilkan profil WireGuard
-wireproxy -> bungkus profil jadi listener SOCKS5 di 127.0.0.1:<port>
-privoxy   -> bungkus SOCKS5 itu jadi listener HTTP
-supervisor-> cek tiap CHECK_INTERVAL detik, sembuhkan yang rusak
-```
-
-Setiap slot punya siklus hidup sendiri:
+## Arsitektur
 
 ```
-starting -> healthy -> (cooldown | duplicate | blocked | dead) -> restart/re-register
+9Router / klien HTTP
+        │
+        ▼
+   warp-http (privoxy :8118)   ← hanya menerima http://
+        │
+        ▼
+   warp (wireproxy :25344)     ← SOCKS5, tunnel WireGuard ke WARP
+        │
+        ▼
+   Cloudflare WARP → internet (IP Cloudflare)
 ```
 
-Aturan penyembuhan, dari yang paling murah:
+Kalau klien mendukung SOCKS5, lewati privoxy dan pakai `:25344` langsung.
 
-1. Proses mati        -> restart wireproxy (sering dapat IP baru)
-2. Exit IP duplikat   -> hapus config, register ulang
-3. Target balas 403   -> IP diblok, register ulang
-4. Target balas 429   -> cooldown, jangan dipakai sampai COOLDOWN_SECONDS habis
-5. Gagal berkali-kali -> tetap dicoba, dengan jeda REGISTER_DELAY antar registrasi
+## Siklus hidup agent
 
-## Instalasi
+1. **boot** — kalau belum ada `wireproxy.conf`, register device WARP baru
+2. **start** — jalankan `wireproxy` di background
+3. **verify** (tiap `CHECK_INTERVAL` detik):
+   - IP keluar ada? tidak → rotate
+   - IP keluar sama dengan IP asli container? → WARP leak → rotate
+   - target (`TARGET_URL`) balas 200/3xx? tidak → rotate
+   - target balas 429 → cooldown `COOLDOWN_SECONDS`, tunnel dipertahankan
+4. **rotate** — kill wireproxy, hapus profil, register ulang, start lagi
+5. gagal berulang → backoff naik 60 → 120 → 240 → 300 detik
+
+## Status agent
+
+```bash
+sudo docker exec warp /app/scripts/healthcheck.sh
+```
+
+Field penting di `/data/state.json`:
+
+- `status` — `registering` / `starting` / `healthy` / `cooldown` / `rotating` / `failed`
+- `identity` — 12 karakter pertama PeerKey (harus berganti tiap rotate)
+- `ip` — IP keluar yang terakhir terverifikasi
+- `leak` — `yes` kalau IP keluar == IP asli (tunnel tidak dipakai)
+- `last_rotate_reason` — alasan rotate terakhir
+
+## Deploy
 
 ```bash
 git clone https://github.com/dedysurya13/warp-pool.git
 cd warp-pool
-docker compose up -d --build
+sudo docker compose up -d --build
 ```
 
-Cek status:
+Port sengaja bind ke `127.0.0.1` — akses dari luar wajib lewat SSH tunnel.
 
 ```bash
-docker exec warp-pool /app/scripts/healthcheck.sh
-docker exec warp-pool /app/scripts/test-rotation.sh
+ssh -N -L 8118:127.0.0.1:8118 -L 25344:127.0.0.1:25344 user@vps
 ```
 
-Tes jalur HTTP:
+## Verifikasi
 
 ```bash
-docker exec warp-pool /app/scripts/verify-http-proxies.sh
+# status lengkap + IP live
+sudo docker exec warp /app/scripts/healthcheck.sh
 ```
-
-## Environment
-
-| Variabel | Default | Arti |
-|---|---|---|
-| `POOL_SIZE` | `3` | jumlah slot proxy |
-| `BASE_PORT` | `25344` | port SOCKS5 slot 0; slot N = BASE_PORT + N |
-| `CHECK_INTERVAL` | `300` | jeda antar siklus pengecekan (detik) |
-| `COOLDOWN_SECONDS` | `1800` | lama cooldown setelah kena 429 |
-| `REGISTER_DELAY` | `60` | jeda minimum antar registrasi WARP |
-| `TARGET_URL` | `https://opencode.ai` | endpoint untuk cek apakah IP diterima |
-| `HEALTH_URL` | `https://api.ipify.org` | endpoint untuk membaca exit IP |
-| `MIN_HEALTHY` | `2` | batas bawah sebelum kirim notifikasi |
-| `TELEGRAM_BOT_TOKEN` | kosong | opsional, untuk notifikasi |
-| `TELEGRAM_CHAT_ID` | kosong | opsional |
-
-Kalau `POOL_SIZE` diubah, sesuaikan juga jumlah service `warp-http-*` dan daftar `ports` di compose.
-
-## Menghubungkan ke klien
-
-Semua port hanya listen di `127.0.0.1` host. Untuk klien di mesin lain, pakai SSH tunnel:
 
 ```bash
-ssh -L 25344:127.0.0.1:25344 -L 25345:127.0.0.1:25345 -L 25346:127.0.0.1:25346 \
-    -L 8118:127.0.0.1:8118 -L 8119:127.0.0.1:8119 -L 8120:127.0.0.1:8120 \
-    ubuntu@<vps>
+# HTTP proxy benar-benar lewat WARP (bukan IP asli)
+sudo docker exec warp /app/scripts/verify-http-proxies.sh
 ```
 
-Atau permanen lewat `~/.ssh/config`:
-
-```
-Host warppool
-    HostName <vps>
-    User ubuntu
-    IdentityFile ~/.ssh/id_ed25519
-    LocalForward 25344 127.0.0.1:25344
-    LocalForward 25345 127.0.0.1:25345
-    LocalForward 25346 127.0.0.1:25346
-    LocalForward 8118 127.0.0.1:8118
-    LocalForward 8119 127.0.0.1:8119
-    LocalForward 8120 127.0.0.1:8120
+```bash
+# kalau ada yang aneh
+sudo docker exec warp /app/scripts/diagnose.sh
 ```
 
-### 9Router
+## Konfigurasi
 
-9Router menolak skema `socks5://` (`Invalid URL protocol: the URL must start with http: or https:`), jadi pakai port HTTP:
+Semua lewat environment di `docker-compose.yml`:
+
+- `SOCKS_PORT` (default `25344`)
+- `CHECK_INTERVAL` (default `60`) — jeda verifikasi
+- `COOLDOWN_SECONDS` (default `1800`) — istirahat saat kena 429
+- `REGISTER_RETRY_DELAY` (default `30`) — jeda antar percobaan register
+- `MAX_REGISTER_ATTEMPTS` (default `5`)
+- `TARGET_URL` (default `https://opencode.ai`)
+- `HEALTH_URL` (default `https://api.ipify.org`)
+
+Naikkan `REGISTER_RETRY_DELAY` ke `120` kalau Cloudflare mulai menolak
+registrasi beruntun.
+
+## 9Router
+
+Tambahkan sebagai proxy pool berisi **satu** entri:
 
 ```
 http://127.0.0.1:8118
-http://127.0.0.1:8119
-http://127.0.0.1:8120
 ```
 
-Buat satu pool per URL (field `Proxy URL` hanya menerima satu URL), lalu assign pool ke provider. Mode rotasi: **on-error**, bukan round-robin. Nyalakan **Strict Proxy** supaya request gagal terang-terangan alih-alih diam-diam keluar lewat IP asli.
+Kalau IP-nya kena limit, agent otomatis rotate dalam ≤ `CHECK_INTERVAL`
+detik. Untuk hasil tercepat, restart tunnel manual:
 
-### Klien yang mendukung SOCKS5
-
-Pakai port `25344`–`25346` dengan skema `socks5h://` (DNS resolve di sisi proxy, bukan di sisi klien):
-
-```
-socks5h://127.0.0.1:25344
+```bash
+sudo docker restart warp
 ```
 
-## Status
+## Log
 
-`/data/status.json` berisi ringkasan mesin-terbaca:
-
-```json
-{
-  "updated": "2026-11-21T01:00:00Z",
-  "pool_size": 3,
-  "slots": [
-    {"slot": "0", "port": "25344", "ip": "104.28.x.x", "status": "healthy"}
-  ]
-}
+```bash
+sudo docker logs -f warp
 ```
 
-## Catatan operasional
-
-- Registrasi WARP berlebihan dari satu IP bisa diblokir Cloudflare sementara. `REGISTER_DELAY` ada untuk itu — jangan dikecilkan.
-- IP WARP bersifat shared. Sebagian IP mungkin sudah tidak diterima target; itulah gunanya pengecekan `TARGET_URL`.
-- Container tidak expose port ke `0.0.0.0` dengan sengaja. Jangan ubah binding di `docker-compose.yml` tanpa alasan.
-- Setelah mengubah kode, rebuild **dan** bersihkan state: `git pull && docker compose down -v && docker compose up -d --build`. Tanpa `-v`, state lama tetap dipakai dan perbaikan tampak tidak berhasil.
-
-## Struktur
-
-```
-Dockerfile
-docker-compose.yml
-scripts/
-  entrypoint.sh           mulai supervisor
-  supervisor.sh           loop utama: health check + penyembuhan
-  register-slot.sh        daftar WARP + jalankan wireproxy untuk satu slot
-  healthcheck.sh          tabel status / --json / --quick
-  test-rotation.sh        lihat exit IP tiap slot (SOCKS5)
-  verify-http-proxies.sh  lihat exit IP tiap port HTTP
-  common.sh               helper bersama
+```bash
+# log agent (juga tersimpan di volume)
+sudo docker exec warp tail -50 /data/warp/agent.log
 ```

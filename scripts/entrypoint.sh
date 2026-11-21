@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
+# Entrypoint: run the single WARP agent, tee its output to a log file so
+# `docker logs` AND /data/warp/agent.log both work.
+
 set -uo pipefail
 
-echo "[entrypoint] warp-pool starting"
-echo "[entrypoint] pool=$POOL_SIZE base_port=$BASE_PORT interval=${CHECK_INTERVAL}s"
+STATE_DIR="${STATE_DIR:-/data}"
+mkdir -p "$STATE_DIR/warp"
 
-mkdir -p "$STATE_DIR"
+exec > >(tee -a "$STATE_DIR/warp/agent.log") 2>&1
 
-# sanity checks
-for bin in wgcf wireproxy curl jq; do
-    command -v "$bin" >/dev/null 2>&1 || { echo "[entrypoint] missing binary: $bin" >&2; exit 1; }
-done
-
-exec /app/scripts/supervisor.sh
+exec /app/scripts/agent.sh

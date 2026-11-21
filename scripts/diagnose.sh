@@ -1,45 +1,67 @@
 #!/usr/bin/env bash
-# Diagnose why the HTTP front-ends are not answering.
-#   docker exec warp-pool /app/scripts/diagnose.sh
-# Also checks the privoxy sidecars when docker CLI is reachable.
+# Diagnosa lengkap agent WARP tunggal.
+#   docker exec warp /app/scripts/diagnose.sh
 
 set -uo pipefail
 
-echo "=== 1. SOCKS5 slot hidup? =========================================="
-for p in 25344 25345 25346; do
-    ip="$(curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:$p" https://api.ipify.org 2>/dev/null)"
-    printf '  socks5 :%s -> %s\n' "$p" "${ip:-MATI}"
+STATE_DIR="${STATE_DIR:-/data}"
+DIR="$STATE_DIR/warp"
+SOCKS_PORT="${SOCKS_PORT:-25344}"
+
+echo "=== 1. Status agent ================================================="
+/app/scripts/healthcheck.sh 2>/dev/null || echo "  <healthcheck gagal>"
+
+echo
+echo "=== 2. SOCKS5 langsung =============================================="
+ip="$(curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://api.ipify.org 2>/dev/null)"
+printf '  socks5 :%s -> %s\n' "$SOCKS_PORT" "${ip:-MATI}"
+
+echo
+echo "=== 3. HTTP (privoxy) ==============================================="
+for p in 8118; do
+    h="$(curl -fsS --max-time 15 -x "http://127.0.0.1:$p" https://api.ipify.org 2>/dev/null)"
+    printf '  http  :%s -> %s\n' "$p" "${h:-MATI}"
 done
 
 echo
-echo "=== 2. Status slot menurut supervisor =============================="
-/app/scripts/healthcheck.sh
+echo "=== 4. IP asli container ============================================"
+d="$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null)"
+echo "  ${d:-<gagal>}"
 
 echo
-echo "=== 3. IP container ini (yang dipakai privoxy untuk connect) ======="
-hostname -i 2>/dev/null | tr ' ' '\n' | grep -v '^$' || echo "  <tidak terbaca>"
+echo "=== 5. Proses ======================================================="
+ps -eo pid,etime,cmd 2>/dev/null | grep -E '[w]ireproxy|[p]rivoxy' | sed 's/^/  /' || echo "  tidak ada"
 
 echo
-echo "=== 4. Proses wireproxy per slot ==================================="
-ps -eo pid,etime,cmd 2>/dev/null | grep '[w]ireproxy' | sed 's/^/  /' || echo "  tidak ada"
+echo "=== 6. Identitas WARP ==============================================="
+if [ -f "$DIR/wgcf-profile.conf" ]; then
+    awk -F' = ' '/^PrivateKey/{print "  PrivateKey : " substr($2,1,12)"..."}
+                 /^PublicKey/{print "  PeerKey    : " substr($2,1,12)"..."}
+                 /^Endpoint/{print "  Endpoint   : " $2}' "$DIR/wgcf-profile.conf"
+else
+    echo "  <profil belum ada>"
+fi
 
 echo
-echo "=== 5. Log slot terakhir (20 baris) ================================"
-for i in 0 1 2; do
-    echo "--- slot $i ---"
-    tail -8 "/data/pool/slot-$i/slot.log" 2>/dev/null | sed 's/^/  /' || echo "  <tidak ada log>"
-done
+echo "=== 7. Log agent (12 baris) ========================================="
+tail -12 "$DIR/agent.log" 2>/dev/null | sed 's/^/  /' || echo "  <tidak ada>"
 
 echo
-echo "=== 6. Petunjuk ===================================================="
+echo "=== 8. Log register terakhir ========================================"
+tail -6 "$DIR/register.log" 2>/dev/null | sed 's/^/  /' || echo "  <tidak ada>"
+
+echo
+echo "=== 9. Log wireproxy (8 baris) ======================================"
+tail -8 "$DIR/wireproxy.log" 2>/dev/null | sed 's/^/  /' || echo "  <tidak ada>"
+
+echo
+echo "=== 10. Petunjuk ===================================================="
 cat <<'EOF'
-Bagian 1 semua MATI          -> WARP pool bermasalah, bukan privoxy.
-Bagian 1 hidup, HTTP mati    -> cek dari HOST:
-    docker ps -a --filter name=warp-http
-    docker logs warp-http-0 --tail 30
-    docker exec warp-http-0 nc -z -w 3 warp-pool 25344; echo "exit=$?"
-
-Slot yang MATI di bagian 1 tapi "starting" di bagian 2 berarti
-wireproxy sudah keluar tapi state belum diperbarui (restart-loop).
-Lihat bagian 5 untuk penyebabnya.
+Bagian 1 status healthy + bagian 2 ada IP  -> normal, tidak ada yang perlu
+Bagian 2 MATI, bagian 1 status rotating    -> agent sedang register ulang
+Bagian 2 MATI, status failed               -> Cloudflare menolak registrasi
+                                              cek bagian 8, naikkan
+                                              REGISTER_RETRY_DELAY
+Bagian 2 ada IP tapi sama dengan bagian 4  -> WARP leak, agent akan rotate
+Bagian 2 hidup, bagian 3 MATI              -> cek: docker logs warp-http
 EOF
