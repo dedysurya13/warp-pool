@@ -22,6 +22,7 @@ mark_register() {
 }
 
 STATUS_FILE="$STATE_DIR/status.json"
+PROBE_INTERVAL="${PROBE_INTERVAL:-45}"
 
 cleanup() {
     log "supervisor: shutting down"
@@ -37,16 +38,14 @@ start_slot() {
     local idx="$1"
     local dir; dir="$(slot_dir "$idx")"
 
-    # Fresh registration only when there is no usable config yet.
     if [ -f "$dir/wireproxy.conf" ] && [ "$(st_get "$idx" status)" != "dead" ]; then
         log "slot $idx: reusing existing wireproxy config"
-        HOME="$dir" wireproxy -c "$dir/wireproxy.conf" >>"$dir/wireproxy.log" 2>&1 &
+        wireproxy -c "$dir/wireproxy.conf" >>"$dir/wireproxy.log" 2>&1 &
         PID[$idx]=$!
         st_set "$idx" status "starting"
         return 0
     fi
 
-    # Respect a delay between WARP registrations to avoid Cloudflare rate limits.
     local now elapsed last
     last="$(get_last_register)"
     now="$(date +%s)"
@@ -68,8 +67,18 @@ restart_slot() {
         kill "${PID[$idx]}" 2>/dev/null || true
         wait "${PID[$idx]}" 2>/dev/null || true
     fi
-    st_set "$idx" status "dead"
     start_slot "$idx"
+}
+
+# Give a freshly started wireproxy time to complete its WARP handshake
+# before we call it dead. A cold start needs ~5-15s.
+wait_for_proxy() {
+    local port="$1" tries="${2:-6}" i
+    for (( i=0; i<tries; i++ )); do
+        [ -n "$(proxy_alive "$port")" ] && return 0
+        sleep 5
+    done
+    return 1
 }
 
 write_status() {
@@ -80,7 +89,7 @@ write_status() {
             "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$POOL_SIZE"
         local first=1
         for (( i=0; i<POOL_SIZE; i++ )); do
-            local meta; meta="$(slot_dir "$i")/meta.json"
+            local meta; meta="$(slot_dir "$i")/state.json"
             [ $first -eq 1 ] || printf ','
             first=0
             if [ -f "$meta" ]; then
@@ -101,37 +110,36 @@ log "supervisor: starting pool of $POOL_SIZE on ports $BASE_PORT..$(( BASE_PORT 
 for (( i=0; i<POOL_SIZE; i++ )); do
     st_set "$i" slot "$i"
     start_slot "$i"
-    # stagger startup so registrations do not collide
     sleep 2
 done
 
-sleep 20
-write_status
-
 # --- main loop ---
 while true; do
-    sleep "$CHECK_INTERVAL"
-
     for (( i=0; i<POOL_SIZE; i++ )); do
         port="$(slot_port "$i")"
         dir="$(slot_dir "$i")"
 
-        # supervisor child died?
+        # 1. child process gone -> restart (cheapest fix)
         if [ -n "${PID[$i]:-}" ] && ! kill -0 "${PID[$i]}" 2>/dev/null; then
             log "slot $i: wireproxy process gone, restarting"
-            restart_slot "$i"
-            continue
-        fi
-
-        ip="$(proxy_alive "$port")"
-        if [ -z "$ip" ]; then
-            log "slot $i: health check failed on :$port"
             st_set "$i" status "dead"
             restart_slot "$i"
             continue
         fi
 
-        # duplicate exit IP means rotation is pointless
+        # 2. does it actually answer? give a cold start some grace time
+        ip="$(proxy_alive "$port")"
+        if [ -z "$ip" ]; then
+            if ! wait_for_proxy "$port"; then
+                log "slot $i: no answer on :$port after grace period, restarting"
+                st_set "$i" status "dead"
+                restart_slot "$i"
+                continue
+            fi
+            ip="$(proxy_alive "$port")"
+        fi
+
+        # 3. duplicate exit IP means rotation is pointless
         dup=0
         for (( j=0; j<POOL_SIZE; j++ )); do
             [ "$j" -eq "$i" ] && continue
@@ -142,12 +150,14 @@ while true; do
             log "slot $i: duplicate exit IP $ip, re-registering"
             st_set "$i" status "duplicate"
             rm -f "$dir/wireproxy.conf"
+            st_set "$i" status "dead"
             restart_slot "$i"
             continue
         fi
 
         st_set "$i" ip "$ip"
 
+        # 4. does the target accept this IP?
         target_ok "$port"
         case $? in
             0) st_set "$i" status "healthy" ;;
@@ -161,6 +171,7 @@ while true; do
                 log "slot $i: exit IP $ip blocked by target, replacing"
                 st_set "$i" status "blocked"
                 rm -f "$dir/wireproxy.conf"
+                st_set "$i" status "dead"
                 restart_slot "$i"
                 ;;
             *)
@@ -170,7 +181,6 @@ while true; do
         esac
     done
 
-    # pool health summary
     healthy=0
     for (( i=0; i<POOL_SIZE; i++ )); do
         [ "$(st_get "$i" status)" = "healthy" ] && healthy=$(( healthy + 1 ))
@@ -182,4 +192,6 @@ while true; do
         log "pool degraded: $healthy/$POOL_SIZE healthy"
         notify "warp-pool: hanya $healthy/$POOL_SIZE proxy sehat. Cek container."
     fi
+
+    sleep "$PROBE_INTERVAL"
 done
