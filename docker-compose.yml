@@ -11,9 +11,6 @@ services:
       - "127.0.0.1:25344:25344"
       - "127.0.0.1:25345:25345"
       - "127.0.0.1:25346:25346"
-      - "127.0.0.1:8118:8118"
-      - "127.0.0.1:8119:8119"
-      - "127.0.0.1:8120:8120"
     volumes:
       - warp-pool-data:/data
     environment:
@@ -38,21 +35,25 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # --- HTTP front-ends -------------------------------------------------
-  # Satu privoxy per slot. network_mode: service:warp-pool supaya bisa
-  # menjangkau 127.0.0.1:2534x milik container warp-pool.
+# ─── HTTP front-ends ──────────────────────────────────────────────────
+# Satu privoxy per slot. Dipisah per container (bukan network_mode
+# sidecar) supaya tiap instance benar-benar independen: kalau digabung
+# dalam satu netns, ketiganya berebut port 8118 dan berakhir memakai
+# satu WARP slot yang sama (exit IP identik).
 
   warp-http-0:
-    image: vimagick/privoxy:latest
+    build: ./privoxy
+    image: warp-pool-privoxy:latest
     container_name: warp-http-0
     restart: unless-stopped
-    network_mode: "service:warp-pool"
+    environment:
+      LISTEN_PORT: "8118"
+      SOCKS_HOST: "warp-pool"
+      SOCKS_PORT: "25344"
     depends_on:
       - warp-pool
-    command:
-      - sh
-      - -c
-      - printf 'listen-address 0.0.0.0:8118\nforward-socks5t / 127.0.0.1:25344 .\n' > /etc/privoxy/config && exec privoxy --no-daemon /etc/privoxy/config
+    ports:
+      - "127.0.0.1:8118:8118"
     logging:
       driver: json-file
       options:
@@ -60,16 +61,18 @@ services:
         max-file: "2"
 
   warp-http-1:
-    image: vimagick/privoxy:latest
+    build: ./privoxy
+    image: warp-pool-privoxy:latest
     container_name: warp-http-1
     restart: unless-stopped
-    network_mode: "service:warp-pool"
+    environment:
+      LISTEN_PORT: "8119"
+      SOCKS_HOST: "warp-pool"
+      SOCKS_PORT: "25345"
     depends_on:
       - warp-pool
-    command:
-      - sh
-      - -c
-      - printf 'listen-address 0.0.0.0:8119\nforward-socks5t / 127.0.0.1:25345 .\n' > /etc/privoxy/config && exec privoxy --no-daemon /etc/privoxy/config
+    ports:
+      - "127.0.0.1:8119:8119"
     logging:
       driver: json-file
       options:
@@ -77,16 +80,18 @@ services:
         max-file: "2"
 
   warp-http-2:
-    image: vimagick/privoxy:latest
+    build: ./privoxy
+    image: warp-pool-privoxy:latest
     container_name: warp-http-2
     restart: unless-stopped
-    network_mode: "service:warp-pool"
+    environment:
+      LISTEN_PORT: "8120"
+      SOCKS_HOST: "warp-pool"
+      SOCKS_PORT: "25346"
     depends_on:
       - warp-pool
-    command:
-      - sh
-      - -c
-      - printf 'listen-address 0.0.0.0:8120\nforward-socks5t / 127.0.0.1:25346 .\n' > /etc/privoxy/config && exec privoxy --no-daemon /etc/privoxy/config
+    ports:
+      - "127.0.0.1:8120:8120"
     logging:
       driver: json-file
       options:
