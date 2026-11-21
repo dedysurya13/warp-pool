@@ -188,9 +188,9 @@ register_device() {
         } > "$CONF"
         chmod 600 "$CONF"
 
-        st_set identity "${peer:0:12}"
+        st_set identity "${priv:0:12}"
         st_set registered "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        log "register: identity ${peer:0:12}... written"
+        log "register: device identity ${priv:0:12}... peer ${peer:0:12}..."
         return 0
     done
 
