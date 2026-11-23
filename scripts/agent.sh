@@ -108,6 +108,39 @@ resolve_endpoint_v4() {
     printf '%s' "$ep"
 }
 
+# Parser toleran: jangan bergantung pada spasi persis di sekitar '='.
+# Format wgcf bisa beda antar versi / kalau ada CRLF.
+prof_get() {
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$PROFILE" \
+        | tr -d '\r' | head -1
+}
+
+# Bangun wireproxy.conf dari profil wgcf.
+#
+# Tidak ada bongkar-pasang field: wireproxy menerima format wgcf apa adanya
+# (DNS, MTU, dua Address dalam satu baris). Yang diubah cuma Endpoint ->
+# IPv4. Cara lama memvalidasi tiap field satu-satu dan itu yang bikin agent
+# terjebak di "incomplete profile" selamanya.
+write_conf() {
+    local endpoint ep4
+
+    [ -f "$PROFILE" ] || return 1
+    grep -qE '^[[:space:]]*PrivateKey[[:space:]]*=' "$PROFILE" || return 1
+    grep -qE '^[[:space:]]*PublicKey[[:space:]]*=' "$PROFILE" || return 1
+    grep -qE '^[[:space:]]*Endpoint[[:space:]]*=' "$PROFILE" || return 1
+
+    endpoint="$(prof_get Endpoint)"
+    ep4="$(resolve_endpoint_v4 "$endpoint")"
+
+    cp "$PROFILE" "$CONF"
+    sed -i "s|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = $ep4|" "$CONF"
+    printf '\n[Socks5]\nBindAddress = 0.0.0.0:%s\n' "$SOCKS_PORT" >> "$CONF"
+    chmod 600 "$CONF"
+    # Dipakai pemanggil untuk state/log — yang benar-benar tertulis di conf.
+    EP_USED="$ep4"
+    return 0
+}
+
 # Exit IP through the SOCKS listener, empty string on failure.
 proxy_ip() {
     curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
@@ -222,43 +255,21 @@ register_device() {
             continue
         fi
 
-        priv="$(awk -F' = ' '/^PrivateKey/{print $2}' "$PROFILE")"
-        peer="$(awk -F' = ' '/^PublicKey/{print $2}' "$PROFILE")"
-        endpoint="$(awk -F' = ' '/^Endpoint/{print $2}' "$PROFILE")"
-        addr4="$(awk -F' = ' '/^Address/{print $2}' "$PROFILE" | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}(/[0-9]+)?' | head -1)"
-        addr6="$(awk -F' = ' '/^Address/{print $2}' "$PROFILE" | grep -oE '([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+(/[0-9]+)?' | head -1)"
-
-        if [ -z "$priv" ] || [ -z "$peer" ] || [ -z "$endpoint" ] || [ -z "$addr4" ]; then
-            err "register: incomplete profile (attempt $attempt)"
-            cat "$PROFILE" >&2
+        # Bangun conf dari profil (tanpa bongkar-pasang field).
+        if ! write_conf; then
+            err "register: profil tidak valid (attempt $attempt)"
+            st_set last_register_error "profile tidak valid"
+            head -20 "$PROFILE" | sed 's/^/  | /' >&2
             attempt=$(( attempt + 1 ))
             sleep "$REGISTER_RETRY_DELAY"
             continue
         fi
 
-        {
-            echo "[Interface]"
-            echo "Address = $addr4"
-            if [ -n "$addr6" ]; then
-                echo "Address = $addr6"
-            fi
-            echo "PrivateKey = $priv"
-            echo "DNS = 1.1.1.1"
-            echo
-            echo "[Peer]"
-            echo "PublicKey = $peer"
-            echo "Endpoint = $(resolve_endpoint_v4 "$endpoint")"
-            echo "AllowedIPs = 0.0.0.0/0, ::/0"
-            echo
-            echo "[Socks5]"
-            echo "BindAddress = 0.0.0.0:$SOCKS_PORT"
-        } > "$CONF"
-        chmod 600 "$CONF"
-
-        st_set identity "${priv:0:12}"
-        st_set endpoint "$(resolve_endpoint_v4 "$endpoint")"
+        st_set identity "$(prof_get PrivateKey | cut -c1-12)"
+        st_set endpoint "${EP_USED:-$(prof_get Endpoint)}"
         st_set registered "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        log "register: device identity ${priv:0:12}... peer ${peer:0:12}... endpoint $(resolve_endpoint_v4 "$endpoint")"
+        st_set last_register_error "none"
+        log "register: device ok — endpoint ${EP_USED:-$(prof_get Endpoint)} socks5 :$SOCKS_PORT"
         return 0
     done
 
@@ -353,21 +364,42 @@ verify() {
 log "agent: boot — socks5 :$SOCKS_PORT quota-probe=$QUOTA_ENABLED rotate-on-429=$ROTATE_ON_429"
 
 if [ ! -f "$CONF" ]; then
-    if ! register_device; then
+    if [ -f "$PROFILE" ]; then
+        # Profil sudah ada dari run sebelumnya — bangun ulang conf dari situ,
+        # jangan buang identitas yang masih sehat.
+        if write_conf; then
+            log "boot: conf dibangun ulang dari profil lama (endpoint ${EP_USED:-$(prof_get Endpoint)})"
+            st_set endpoint "${EP_USED:-$(prof_get Endpoint)}"
+            st_set identity "$(prof_get PrivateKey | cut -c1-12)"
+        else
+            log "boot: profil lama tidak valid, register ulang"
+            rm -f "$PROFILE"
+            if ! register_device; then
+                st_set status "failed"
+                err "agent: cannot register at boot, exiting for restart"
+                exit 1
+            fi
+        fi
+    elif ! register_device; then
         st_set status "failed"
         err "agent: cannot register at boot, exiting for restart"
         exit 1
     fi
 else
-    # Migrasi: conf lama masih memakai hostname di Endpoint. Ganti ke IPv4
-    # supaya tunnel tidak mati di container tanpa route IPv6.
-    EP_OLD="$(awk -F' = ' '/^Endpoint/{print $2}' "$CONF")"
-    if [ -n "$EP_OLD" ] && printf '%s' "$EP_OLD" | grep -qE '[A-Za-z]'; then
-        EP_NEW="$(resolve_endpoint_v4 "$EP_OLD")"
-        if [ "$EP_NEW" != "$EP_OLD" ]; then
-            sed -i "s|^Endpoint = .*|Endpoint = $EP_NEW|" "$CONF"
-            log "boot: endpoint $EP_OLD -> $EP_NEW (pin IPv4)"
-            st_set endpoint "$EP_NEW"
+    # Migrasi: conf lama mungkin masih pakai hostname di Endpoint atau belum
+    # punya [Socks5]. Bangun ulang dari profil kalau profilnya ada.
+    if [ -f "$PROFILE" ] && write_conf; then
+        log "boot: conf dimigrasi ulang (endpoint ${EP_USED:-$(prof_get Endpoint)})"
+        st_set endpoint "${EP_USED:-$(prof_get Endpoint)}"
+    else
+        EP_OLD="$(awk -F' = ' '/^Endpoint/{print $2}' "$CONF")"
+        if [ -n "$EP_OLD" ] && printf '%s' "$EP_OLD" | grep -qE '[A-Za-z]'; then
+            EP_NEW="$(resolve_endpoint_v4 "$EP_OLD")"
+            if [ "$EP_NEW" != "$EP_OLD" ]; then
+                sed -i "s|^Endpoint = .*|Endpoint = $EP_NEW|" "$CONF"
+                log "boot: endpoint $EP_OLD -> $EP_NEW (pin IPv4)"
+                st_set endpoint "$EP_NEW"
+            fi
         fi
     fi
 fi
