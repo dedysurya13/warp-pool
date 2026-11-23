@@ -131,6 +131,30 @@ sudo docker exec warp /app/scripts/quota-check.sh direct
 sudo docker exec warp /app/scripts/diagnose.sh
 ```
 
+## Troubleshooting
+
+**`ip (live): MATI` tapi port 25344 terbuka.** Endpoint WARP di-resolve ke
+IPv6, container tidak punya route IPv6 — SOCKS tetap listen, handshake
+tidak pernah jadi, setiap CONNECT balas SOCKS error 4. Sekarang endpoint
+di-pin ke IPv4 (`getent ahostsv4`), dan conf lama dimigrasi otomatis saat
+boot. Kalau `endpoint :` di healthcheck masih berupa hostname, hapus
+`/data/warp/wireproxy.conf` lalu restart.
+
+```bash
+sudo docker exec warp rm -f /data/warp/wireproxy.conf
+sudo docker restart warp
+```
+
+**`status: failed` + `registered` lama.** Registrasi WARP gagal. Lihat
+`register err :` di healthcheck, atau log lengkapnya:
+
+```bash
+sudo docker exec warp tail -20 /data/warp/register.log
+```
+
+Kalau isinya 429/rate limit, Cloudflare membatasi registrasi per IP —
+tunggu (bisa berjam-jam), jangan di-restart berulang.
+
 ## Konfigurasi
 
 Semua lewat environment di `docker-compose.yml`:

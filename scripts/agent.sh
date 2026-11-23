@@ -81,6 +81,33 @@ trap cleanup INT TERM
 
 # ---------------------------------------------------------------- probing
 
+# Pin endpoint WARP ke IPv4.
+#
+# wireproxy menerima hostname dan bisa memilih hasil AAAA. Container yang
+# tidak punya route IPv6 akan: tetap LISTEN di port SOCKS, tapi handshake
+# WireGuard tidak pernah jadi -> setiap CONNECT balas SOCKS error 4
+# ("host unreachable"). Gejalanya persis seperti proxy mati padahal port
+# terbuka. Diuji: hostname gagal, 162.159.192.1:2408 berhasil.
+resolve_endpoint_v4() {
+    local ep="$1" host port ip
+    host="${ep%:*}"
+    port="${ep##*:}"
+
+    # Sudah berupa literal IPv4 -> pakai apa adanya.
+    if printf '%s' "$host" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        printf '%s' "$ep"
+        return 0
+    fi
+
+    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [ -n "$ip" ]; then
+        printf '%s:%s' "$ip" "$port"
+        return 0
+    fi
+
+    printf '%s' "$ep"
+}
+
 # Exit IP through the SOCKS listener, empty string on failure.
 proxy_ip() {
     curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
@@ -179,6 +206,9 @@ register_device() {
         if [ ! -f "$PROFILE" ]; then
             err "register: no profile produced (attempt $attempt)"
             tail -6 "$DIR/register.log" >&2 2>/dev/null || true
+            # Simpan sebabnya di state supaya kelihatan dari healthcheck,
+            # tanpa perlu masuk container buat baca log.
+            st_set last_register_error "$(tail -1 "$DIR/register.log" 2>/dev/null | cut -c1-160)"
             delay="$REGISTER_RETRY_DELAY"
             # Cloudflare membatasi registrasi per IP. Kalau kena 429,
             # ngulang tiap 30 detik cuma nambah hitungan -> tunggu lama.
@@ -217,7 +247,7 @@ register_device() {
             echo
             echo "[Peer]"
             echo "PublicKey = $peer"
-            echo "Endpoint = $endpoint"
+            echo "Endpoint = $(resolve_endpoint_v4 "$endpoint")"
             echo "AllowedIPs = 0.0.0.0/0, ::/0"
             echo
             echo "[Socks5]"
@@ -226,8 +256,9 @@ register_device() {
         chmod 600 "$CONF"
 
         st_set identity "${priv:0:12}"
+        st_set endpoint "$(resolve_endpoint_v4 "$endpoint")"
         st_set registered "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        log "register: device identity ${priv:0:12}... peer ${peer:0:12}..."
+        log "register: device identity ${priv:0:12}... peer ${peer:0:12}... endpoint $(resolve_endpoint_v4 "$endpoint")"
         return 0
     done
 
@@ -326,6 +357,18 @@ if [ ! -f "$CONF" ]; then
         st_set status "failed"
         err "agent: cannot register at boot, exiting for restart"
         exit 1
+    fi
+else
+    # Migrasi: conf lama masih memakai hostname di Endpoint. Ganti ke IPv4
+    # supaya tunnel tidak mati di container tanpa route IPv6.
+    EP_OLD="$(awk -F' = ' '/^Endpoint/{print $2}' "$CONF")"
+    if [ -n "$EP_OLD" ] && printf '%s' "$EP_OLD" | grep -qE '[A-Za-z]'; then
+        EP_NEW="$(resolve_endpoint_v4 "$EP_OLD")"
+        if [ "$EP_NEW" != "$EP_OLD" ]; then
+            sed -i "s|^Endpoint = .*|Endpoint = $EP_NEW|" "$CONF"
+            log "boot: endpoint $EP_OLD -> $EP_NEW (pin IPv4)"
+            st_set endpoint "$EP_NEW"
+        fi
     fi
 fi
 
