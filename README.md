@@ -40,10 +40,38 @@ Kalau klien mendukung SOCKS5, lewati privoxy dan pakai `:25344` langsung.
 3. **verify** (tiap `CHECK_INTERVAL` detik):
    - IP keluar ada? tidak → rotate
    - IP keluar sama dengan IP asli container? → WARP leak → rotate
-   - target (`TARGET_URL`) balas 200/3xx? tidak → rotate
-   - target balas 429 → cooldown `COOLDOWN_SECONDS`, tunnel dipertahankan
+   - probe kuota (tiap `QUOTA_CHECK_INTERVAL`, `QUOTA_ENABLED=1`):
+     POST 1 token ke model gratis, lihat HTTP code-nya
+   - 429 → status `quota`, **tidak** rotate (lihat catatan di bawah)
+   - 401/403 → rotate
 4. **rotate** — kill wireproxy, hapus profil, register ulang, start lagi
 5. gagal berulang → backoff naik 60 → 120 → 240 → 300 detik
+
+### Kenapa probe kuota bukan `TARGET_URL`
+
+Versi lama memakai `TARGET_URL=https://opencode.ai` — halaman depan.
+Halaman depan selalu balas 200, jadi **429 tidak pernah terdeteksi** dan
+agent selalu melaporkan `healthy` walau kuota sudah habis. Sekarang probe
+menembak endpoint inference yang sebenarnya.
+
+### Kenapa 429 tidak di-rotate
+
+Limit bucket gratis opencode diikat ke **identitas anonim** (kredensial
+`Bearer public` + project/session), bukan ke alamat IP. Buktinya: dua IP
+berbeda (exit WARP Cloudflare dan IP VPS langsung) sama-sama dapat
+`FreeUsageLimitError`. Ganti IP tidak membuka limit, dan tiap rotate
+mubazir satu registrasi WARP — yang sendirinya dibatasi Cloudflare per IP.
+
+Set `ROTATE_ON_429=1` kalau suatu saat targetnya justru limit per-IP.
+
+### Rotate manual
+
+```bash
+# tidak perlu masuk shell container
+sudo docker exec warp touch /data/warp/rotate.req
+```
+
+Agent akan menghapus file itu dan rotate dalam ≤ `CHECK_INTERVAL` detik.
 
 ## Status agent
 
@@ -53,10 +81,12 @@ sudo docker exec warp /app/scripts/healthcheck.sh
 
 Field penting di `/data/state.json`:
 
-- `status` — `registering` / `starting` / `healthy` / `cooldown` / `rotating` / `failed`
+- `status` — `registering` / `starting` / `healthy` / `quota` / `blocked` / `rotating` / `failed`
 - `identity` — 12 karakter pertama PeerKey (harus berganti tiap rotate)
 - `ip` — IP keluar yang terakhir terverifikasi
 - `leak` — `yes` kalau IP keluar == IP asli (tunnel tidak dipakai)
+- `quota` — `ok` / `429` / `403` / `error` (hasil probe terakhir)
+- `quota_checked` — kapan probe terakhir jalan
 - `last_rotate_reason` — alasan rotate terakhir
 
 ## Deploy
@@ -86,6 +116,17 @@ sudo docker exec warp /app/scripts/verify-http-proxies.sh
 ```
 
 ```bash
+# kuota bucket gratis masih boleh atau sudah 429?
+sudo docker exec warp /app/scripts/quota-check.sh
+```
+
+```bash
+# banding: lewat WARP vs IP asli VPS — buktikan limit ikut IP atau tidak
+sudo docker exec warp /app/scripts/quota-check.sh
+sudo docker exec warp /app/scripts/quota-check.sh direct
+```
+
+```bash
 # kalau ada yang aneh
 sudo docker exec warp /app/scripts/diagnose.sh
 ```
@@ -96,10 +137,15 @@ Semua lewat environment di `docker-compose.yml`:
 
 - `SOCKS_PORT` (default `25344`)
 - `CHECK_INTERVAL` (default `60`) — jeda verifikasi
-- `COOLDOWN_SECONDS` (default `1800`) — istirahat saat kena 429
+- `COOLDOWN_SECONDS` (default `1800`) — durasi status `quota` sebelum dicoba lagi
+- `QUOTA_ENABLED` (default `1`) — probe kuota on/off
+- `QUOTA_CHECK_INTERVAL` (default `300`) — jeda probe kuota (tiap probe makan 1 token)
+- `QUOTA_URL` / `QUOTA_MODEL` — endpoint + model yang diprobe
+- `ROTATE_ON_429` (default `0`) — `1` kalau targetnya limit per-IP
+- `MIN_ROTATE_GAP` (default `120`) — jarak minimum antar rotate
 - `REGISTER_RETRY_DELAY` (default `30`) — jeda antar percobaan register
+- `REGISTER_429_DELAY` (default `300`) — jeda kalau register kena 429 Cloudflare
 - `MAX_REGISTER_ATTEMPTS` (default `5`)
-- `TARGET_URL` (default `https://opencode.ai`)
 - `HEALTH_URL` (default `https://api.ipify.org`)
 
 Naikkan `REGISTER_RETRY_DELAY` ke `120` kalau Cloudflare mulai menolak
@@ -113,8 +159,9 @@ Tambahkan sebagai proxy pool berisi **satu** entri:
 http://127.0.0.1:8118
 ```
 
-Kalau IP-nya kena limit, agent otomatis rotate dalam ≤ `CHECK_INTERVAL`
-detik. Untuk hasil tercepat, restart tunnel manual:
+Tunnel tetap dipakai walau kuota model habis — 429 datang dari provider
+model, bukan dari WARP. Yang berubah cuma status agent jadi `quota`.
+Untuk hasil tercepat, restart tunnel manual:
 
 ```bash
 sudo docker restart warp

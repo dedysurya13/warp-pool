@@ -29,10 +29,16 @@ RUN chmod +x /app/scripts/*.sh
 ENV SOCKS_PORT=25344 \
     STATE_DIR=/data \
     HEALTH_URL=https://api.ipify.org \
-    TARGET_URL=https://opencode.ai \
     CHECK_INTERVAL=60 \
     COOLDOWN_SECONDS=1800 \
+    QUOTA_ENABLED=1 \
+    QUOTA_CHECK_INTERVAL=300 \
+    QUOTA_MODEL=deepseek-v4.1-flash-free \
+    QUOTA_URL=https://opencode.ai/inference/openai/v1/chat/completions \
+    ROTATE_ON_429=0 \
+    MIN_ROTATE_GAP=120 \
     REGISTER_RETRY_DELAY=30 \
+    REGISTER_429_DELAY=300 \
     MAX_REGISTER_ATTEMPTS=5
 
 VOLUME ["/data"]

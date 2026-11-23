@@ -45,7 +45,15 @@ echo "identity      : $(st_get identity)"
 echo "ip (state)    : $(st_get ip)"
 echo "ip (live)     : ${LIVE:-MATI}"
 echo "leak          : $(st_get leak)"
+echo "quota         : $(st_get quota)"
+echo "quota checked : $(st_get quota_checked)"
 echo "cooldown      : $CD_HUMAN"
 echo "registered    : $(st_get registered)"
 echo "last ok       : $(st_get last_ok)"
 echo "last rotate   : $(st_get last_rotate_reason)"
+
+if [ "$(st_get status)" = "quota" ]; then
+    echo
+    echo "CATATAN: kuota bucket gratis habis. Ganti IP tidak membantu —"
+    echo "limit diikat ke identitas anonim, bukan alamat IP."
+fi
